@@ -36,8 +36,6 @@ argument (`relay`, `server`, `client`):
 | relay  | `relay.go`  | Public rendezvous service: HTTP `/server` (WebSocket) for servers, HTTP `/client` for client tunnel requests, UDP listener for hole-punch packets. |
 | server | `server.go` | Runs next to the target service. Registers with the relay over WebSocket, listens for punch requests, accepts an inbound QUIC connection and pipes the stream to/from the configured TCP `-forward` address. |
 | client | `client.go` | Asks the relay for a tunnel, dials the advertised UDP address over QUIC, and pipes the stream to/from its own `stdin`/`stdout`. |
-| cert   | `cert.go`   | Generates ephemeral self-signed ECDSA P-256 certificates and verifies peers by SHA-256 fingerprint. |
-| message| `message.go`| JSON wire format shared by relay/server/client. |
 
 ## Protocol
 
