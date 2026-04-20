@@ -1,0 +1,88 @@
+name: Build Binaries
+
+on:
+  push:
+    tags:
+      - 'release-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm
+            goarm: 7
+          - os: ubuntu-latest
+            goos: android
+            goarch: arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          output="quic-link"
+          if [ "$GOOS" = "windows" ]; then
+            output="quic-link.exe"
+          fi
+          go build -trimpath -ldflags="-s -w" -o "$output" .
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#release-}"
+          archive="quic-link_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          if [ -n "${{ matrix.goarm }}" ]; then
+            archive="${archive}v${{ matrix.goarm }}"
+          fi
+          mkdir -p dist
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cp quic-link.exe "dist/${archive}.exe"
+            (cd dist && powershell -NoProfile -Command "Compress-Archive -Path '${archive}.exe' -DestinationPath '${archive}.zip' -Force")
+            rm -f "dist/${archive}.exe"
+          else
+            cp quic-link "dist/${archive}"
+            tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
+            rm -f "dist/${archive}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-link-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
