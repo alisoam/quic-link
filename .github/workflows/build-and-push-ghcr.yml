@@ -40,4 +40,4 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository }}:v${{ steps.vars.outputs.version }}
+          tags: ghcr.io/${{ github.repository }}:${{ steps.vars.outputs.version }}
