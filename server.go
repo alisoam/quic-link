@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -166,16 +165,13 @@ func (s *Server) punchRequest(msg *WSMessagePunchRequest) error {
 	}
 	slog.Info("UDP punch listener started on", "address", conn.LocalAddr().String())
 
-	u, err := url.Parse(s.relayURL)
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("failed to parse relay URL: %w", err)
-	}
-	addr, err := net.ResolveUDPAddr("udp", u.Hostname()+":"+u.Port())
+	addr, err := net.ResolveUDPAddr("udp", msg.PunchServerAddress)
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("failed to resolve UDP address: %w", err)
 	}
+
+	slog.Info("sending UDP punch", "token", msg.Token, "relay_address", addr.String())
 
 	_, err = conn.WriteTo([]byte(msg.Token), addr)
 	if err != nil {

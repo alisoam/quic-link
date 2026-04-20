@@ -41,25 +41,27 @@ func NewService(conn *websocket.Conn, fingerprint string) *Service {
 }
 
 type Relay struct {
-	authToken    string
-	port         int
-	services     map[string][]*Service
-	punchEntrys  map[string]net.Addr
-	mu           sync.Mutex
-	pingInterval time.Duration
-	readWait     time.Duration
-	writeWait    time.Duration
+	authToken          string
+	port               int
+	punchServerAddress string
+	services           map[string][]*Service
+	punchEntrys        map[string]net.Addr
+	mu                 sync.Mutex
+	pingInterval       time.Duration
+	readWait           time.Duration
+	writeWait          time.Duration
 }
 
-func NewRelay(authToken string, port int) *Relay {
+func NewRelay(authToken string, port int, punchServerAddress string) *Relay {
 	return &Relay{
-		authToken:    authToken,
-		port:         port,
-		services:     make(map[string][]*Service),
-		punchEntrys:  make(map[string]net.Addr),
-		pingInterval: 1 * time.Second,
-		readWait:     10 * time.Second,
-		writeWait:    10 * time.Second,
+		authToken:          authToken,
+		port:               port,
+		punchServerAddress: punchServerAddress,
+		services:           make(map[string][]*Service),
+		punchEntrys:        make(map[string]net.Addr),
+		pingInterval:       1 * time.Second,
+		readWait:           10 * time.Second,
+		writeWait:          10 * time.Second,
 	}
 }
 
@@ -159,8 +161,9 @@ func (re *Relay) punchRequest(ctx context.Context, conn *websocket.Conn, clientF
 	// send punch request to client
 	value, err := json.Marshal(
 		&WSMessagePunchRequest{
-			Token:             token,
-			ClientFingerprint: clientFingerprint,
+			Token:              token,
+			PunchServerAddress: re.punchServerAddress,
+			ClientFingerprint:  clientFingerprint,
 		},
 	)
 	if err != nil {

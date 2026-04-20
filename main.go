@@ -76,6 +76,9 @@ func runRelay(args []string) error {
 	fs.StringVar(&authToken, "auth-token", "", "authentication token for clients and servers (optional)")
 	port := 0
 	fs.IntVar(&port, "port", 0, "TCP/UDP port the relay listens on (shorthand)")
+	punchServerAddress := ""
+	fs.StringVar(&punchServerAddress, "punch-server-address", "", "address of the punch server to use for NAT traversal")
+
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -83,10 +86,13 @@ func runRelay(args []string) error {
 	if port == 0 {
 		return fmt.Errorf("-port is required")
 	}
+	if punchServerAddress == "" {
+		return fmt.Errorf("-punch-server-address is required")
+	}
 
-	slog.Info("starting relay", "port", port)
+	slog.Info("starting relay", "port", port, "punch_server_address", punchServerAddress)
 
-	NewRelay(authToken, port).Start()
+	NewRelay(authToken, port, punchServerAddress).Start()
 
 	return nil
 }

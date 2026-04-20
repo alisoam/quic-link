@@ -22,8 +22,9 @@ type WSMessageServiceRequest struct {
 }
 
 type WSMessagePunchRequest struct {
-	Token             string `json:"token"`
-	ClientFingerprint string `json:"client_fingerprint,omitempty"`
+	Token              string `json:"token"`
+	PunchServerAddress string `json:"punch_server_address"`
+	ClientFingerprint  string `json:"client_fingerprint,omitempty"`
 }
 
 type WSMessageClientTunnelRequest struct {
