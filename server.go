@@ -152,7 +152,7 @@ func (s *Server) handleWSConnection(conn *websocket.Conn) error {
 }
 
 func (s *Server) punchRequest(msg *WSMessagePunchRequest) error {
-	slog.Info("received punch request", "token", msg.Token, "client_fingerprint", msg.ClientFingerprint)
+	slog.Info("received punch request", "token", msg.Token, "client_fingerprint", msg.ClientFingerprint, "punch_server_address", msg.PunchServerAddress)
 
 	udpAddr, err := net.ResolveUDPAddr("udp", ":0")
 	if err != nil {
