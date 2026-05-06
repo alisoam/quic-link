@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,17 +18,19 @@ import (
 )
 
 type Server struct {
-	relayURL     string
-	authToken    string
-	id           string
-	forwardAddr  *net.TCPAddr
-	readWait     time.Duration
-	writeWait    time.Duration
-	pingInterval time.Duration
-	connTimeout  time.Duration
-	cert         *tls.Certificate
-	fingerprint  string
-	bufferSize   int
+	relayURL      string
+	authToken     string
+	id            string
+	forwardAddr   *net.TCPAddr
+	readWait      time.Duration
+	writeWait     time.Duration
+	pingInterval  time.Duration
+	connTimeout   time.Duration
+	cert          *tls.Certificate
+	fingerprint   string
+	bufferSize    int
+	punchInterval time.Duration
+	punchAttempts int
 }
 
 func NewServer(relayURL string, authToken string, id string, forwardAddr *net.TCPAddr) (*Server, error) {
@@ -39,17 +42,19 @@ func NewServer(relayURL string, authToken string, id string, forwardAddr *net.TC
 	fingerprint := CertFingerprint(cert)
 
 	return &Server{
-		relayURL:     relayURL,
-		authToken:    authToken,
-		id:           id,
-		forwardAddr:  forwardAddr,
-		readWait:     10 * time.Second,
-		writeWait:    10 * time.Second,
-		pingInterval: 1 * time.Second,
-		connTimeout:  30 * time.Second,
-		cert:         cert,
-		fingerprint:  fingerprint,
-		bufferSize:   32 * 1024, // 32KB buffer size for copying
+		relayURL:      relayURL,
+		authToken:     authToken,
+		id:            id,
+		forwardAddr:   forwardAddr,
+		readWait:      10 * time.Second,
+		writeWait:     10 * time.Second,
+		pingInterval:  1 * time.Second,
+		connTimeout:   30 * time.Second,
+		cert:          cert,
+		fingerprint:   fingerprint,
+		bufferSize:    32 * 1024, // 32KB buffer size for copying
+		punchInterval: 10 * time.Millisecond,
+		punchAttempts: 300,
 	}, nil
 }
 
@@ -70,12 +75,21 @@ func (s *Server) Start() error {
 	}
 	defer conn.Close()
 
+	mu := &sync.Mutex{}
+
 	conn.SetReadDeadline(time.Now().Add(s.readWait))
 	conn.SetPingHandler(func(appData string) error {
 		slog.Info("received ping", "remote_addr", conn.RemoteAddr())
 		conn.SetReadDeadline(time.Now().Add(s.readWait))
 		conn.SetWriteDeadline(time.Now().Add(s.writeWait))
-		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(s.writeWait))
+		mu.Lock()
+		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(s.writeWait))
+		mu.Unlock()
+		if err != nil {
+			slog.Error("failed to send pong", "error", err)
+			return err
+		}
+		return nil
 	})
 	conn.SetPongHandler(func(string) error {
 		slog.Info("received pong", "remote_addr", conn.RemoteAddr())
@@ -90,7 +104,9 @@ func (s *Server) Start() error {
 		for range ticker.C {
 			slog.Info("sending ping", "remote_addr", conn.RemoteAddr())
 			conn.SetWriteDeadline(time.Now().Add(s.writeWait))
+			mu.Lock()
 			err := conn.WriteMessage(websocket.PingMessage, []byte{})
+			mu.Unlock()
 			if err != nil {
 				slog.Error("failed to send ping", "error", err)
 				return
@@ -98,18 +114,9 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	err = s.handleWSConnection(conn)
-	if err != nil {
-		return fmt.Errorf("connection error: %w", err)
-	}
-
-	return nil
-}
-
-func (s *Server) handleWSConnection(conn *websocket.Conn) error {
 	v, err := json.Marshal(WSMessageServiceRequest{
-		ID:          s.id,
-		Fingerprint: s.fingerprint,
+		ID:                s.id,
+		ServerFingerprint: s.fingerprint,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to marshal service request: %w", err)
@@ -127,82 +134,122 @@ func (s *Server) handleWSConnection(conn *websocket.Conn) error {
 		msg := &WSMessage{}
 		err := conn.ReadJSON(msg)
 		if err != nil {
-			return err
+			slog.Error("failed to read message", "error", err)
+			return fmt.Errorf("failed to read message: %w", err)
 		}
 
 		slog.Info("received message", "type", msg.Type)
-		switch msg.Type {
-		case WSMessageTypePunchRequest:
-			req := &WSMessagePunchRequest{}
-			err := json.Unmarshal(msg.Value, req)
-			if err != nil {
-				return fmt.Errorf("invalid punch request payload: %w", err)
-			}
-
-			err = s.punchRequest(req)
-			if err != nil {
-				slog.Error("failed to handle punch request", "error", err)
-				return fmt.Errorf("failed to handle punch request: %w", err)
-			}
-		default:
-			slog.Error("unknown message type", "type", msg.Type)
-			return fmt.Errorf("unknown message type: %s", msg.Type)
+		if msg.Type != WSMessageTypePunchRequest {
+			slog.Error("received non-punch request message before punch request", "type", msg.Type)
+			return fmt.Errorf("received non-punch request message before punch request: %s", msg.Type)
 		}
+		pReq := &WSMessagePunchRequest{}
+		err = json.Unmarshal(msg.Value, pReq)
+		if err != nil {
+			slog.Error("invalid punch request payload", "error", err)
+			return fmt.Errorf("invalid punch request payload: %w", err)
+		}
+
+		udpConn, err := s.punchRequest(pReq)
+		if err != nil {
+			slog.Error("failed to handle punch request", "error", err)
+			return fmt.Errorf("failed to handle punch request: %w", err)
+		}
+		slog.Info("punch request handled successfully", "local_address", udpConn.LocalAddr().String())
+
+		err = conn.ReadJSON(msg)
+		if err != nil {
+			slog.Error("failed to read message after punch request", "error", err)
+			return fmt.Errorf("failed to read message after punch request: %w", err)
+		}
+
+		tReq := &WSMessageStartTunnel{}
+		err = json.Unmarshal(msg.Value, tReq)
+		if err != nil {
+			udpConn.Close()
+			slog.Error("invalid start tunnel payload", "error", err)
+			return fmt.Errorf("invalid start tunnel payload: %w", err)
+		}
+
+		slog.Info("received start tunnel request", "peer_address", tReq.PeerAddress, "peer_fingerprint", tReq.PeerFingerprint)
+
+		err = s.startTunnel(udpConn, tReq)
+		if err != nil {
+			udpConn.Close()
+			slog.Error("failed to start tunnel", "error", err)
+			return fmt.Errorf("failed to start tunnel: %w", err)
+		}
+
+		slog.Info("tunnel started successfully")
 	}
 }
 
-func (s *Server) punchRequest(msg *WSMessagePunchRequest) error {
-	slog.Info("received punch request", "token", msg.Token, "client_fingerprint", msg.ClientFingerprint, "punch_server_address", msg.PunchServerAddress)
+func (s *Server) punchRequest(msg *WSMessagePunchRequest) (*net.UDPConn, error) {
+	slog.Info("received punch request", "token", msg.Token, "punch_server_address", msg.PunchServerAddress)
 
 	udpAddr, err := net.ResolveUDPAddr("udp", ":0")
 	if err != nil {
-		return fmt.Errorf("failed to resolve UDP address: %w", err)
+		return nil, fmt.Errorf("failed to resolve UDP address: %w", err)
 	}
 
 	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on UDP: %w", err)
+		return nil, fmt.Errorf("failed to listen on UDP: %w", err)
 	}
 	slog.Info("UDP punch listener started on", "address", conn.LocalAddr().String())
 
 	addr, err := net.ResolveUDPAddr("udp", msg.PunchServerAddress)
 	if err != nil {
 		conn.Close()
-		return fmt.Errorf("failed to resolve UDP address: %w", err)
+		return nil, fmt.Errorf("failed to resolve UDP address: %w", err)
 	}
 
 	slog.Info("sending UDP punch", "token", msg.Token, "relay_address", addr.String())
 
-	_, err = conn.WriteTo([]byte(msg.Token), addr)
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("failed to send UDP punch: %w", err)
-	}
+	go func() {
+		err = startUDPPunch(conn, addr, []byte(msg.Token), s.punchAttempts, s.punchInterval)
+		if err != nil {
+			slog.Error("UDP punch failed", "error", err)
+		}
+	}()
 
+	return conn, nil
+}
+
+func (s *Server) startTunnel(conn *net.UDPConn, msg *WSMessageStartTunnel) error {
 	tlsConf := &tls.Config{
 		Certificates:          []tls.Certificate{*s.cert},
 		NextProtos:            []string{"quic-link"},
 		ClientAuth:            tls.RequireAnyClientCert,
-		VerifyPeerCertificate: VerifyPeerCert(msg.ClientFingerprint),
+		VerifyPeerCertificate: VerifyPeerCert(msg.PeerFingerprint),
 	}
-
 	quicConf := &quic.Config{
 		MaxIdleTimeout:        10 * time.Second,
 		KeepAlivePeriod:       1 * time.Second,
 		MaxIncomingStreams:    1,
 		MaxIncomingUniStreams: -1,
 	}
-
 	ln, err := quic.Listen(conn, tlsConf, quicConf)
 	if err != nil {
 		slog.Error("failed to start QUIC listener", "error", err)
-		conn.Close()
 		return fmt.Errorf("failed to start QUIC listener: %w", err)
+	}
+	peerAddr, err := net.ResolveUDPAddr("udp", msg.PeerAddress)
+	if err != nil {
+		slog.Error("failed to resolve peer UDP address", "error", err)
+		return fmt.Errorf("failed to resolve peer UDP address: %w", err)
 	}
 
 	go func() {
 		defer conn.Close()
 		defer ln.Close()
+
+		go func() {
+			err := startUDPPunch(conn, peerAddr, []byte("punch request"), s.punchAttempts, s.punchInterval)
+			if err != nil {
+				slog.Error("UDP punch to peer failed", "error", err)
+			}
+		}()
 
 		s.handleListener(ln)
 	}()

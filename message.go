@@ -7,8 +7,8 @@ type WSMessageType int
 const (
 	WSMessageTypeServiceRequest WSMessageType = iota
 	WSMessageTypePunchRequest
-	WSMessageTypeClientTunnelRequest
-	WSMessageTypeClientTunnelResponse
+	WSMessageTypeTunnelRequest
+	WSMessageTypeStartTunnel
 )
 
 type WSMessage struct {
@@ -17,22 +17,21 @@ type WSMessage struct {
 }
 
 type WSMessageServiceRequest struct {
-	ID          string `json:"id"`
-	Fingerprint string `json:"fingerprint,omitempty"`
+	ID                string `json:"id"`
+	ServerFingerprint string `json:"server_fingerprint,omitempty"`
 }
 
 type WSMessagePunchRequest struct {
 	Token              string `json:"token"`
 	PunchServerAddress string `json:"punch_server_address"`
-	ClientFingerprint  string `json:"client_fingerprint,omitempty"`
 }
 
-type WSMessageClientTunnelRequest struct {
-	ID          string `json:"id"`
-	Fingerprint string `json:"fingerprint,omitempty"`
+type WSMessageTunnelRequest struct {
+	ID                string `json:"id"`
+	ClientFingerprint string `json:"client_fingerprint,omitempty"`
 }
 
-type WSMessageClientTunnelResponse struct {
-	Address           string `json:"address"`
-	ServerFingerprint string `json:"server_fingerprint,omitempty"`
+type WSMessageStartTunnel struct {
+	PeerAddress     string `json:"peer_address"`
+	PeerFingerprint string `json:"peer_fingerprint,omitempty"`
 }

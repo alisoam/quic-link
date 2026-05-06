@@ -26,6 +26,7 @@ var (
 )
 
 type Service struct {
+	mu          sync.Mutex
 	done        chan struct{}
 	busy        bool
 	conn        *websocket.Conn
@@ -45,11 +46,13 @@ type Relay struct {
 	port               int
 	punchServerAddress string
 	services           map[string][]*Service
-	punchEntrys        map[string]net.Addr
+	punchEntrys        map[string]*net.UDPAddr
 	mu                 sync.Mutex
 	pingInterval       time.Duration
 	readWait           time.Duration
 	writeWait          time.Duration
+	punchInterval      time.Duration
+	punchAttempt       int
 }
 
 func NewRelay(authToken string, port int, punchServerAddress string) *Relay {
@@ -58,10 +61,12 @@ func NewRelay(authToken string, port int, punchServerAddress string) *Relay {
 		port:               port,
 		punchServerAddress: punchServerAddress,
 		services:           make(map[string][]*Service),
-		punchEntrys:        make(map[string]net.Addr),
+		punchEntrys:        make(map[string]*net.UDPAddr),
 		pingInterval:       1 * time.Second,
 		readWait:           10 * time.Second,
 		writeWait:          10 * time.Second,
+		punchInterval:      10 * time.Millisecond,
+		punchAttempt:       300,
 	}
 }
 
@@ -91,7 +96,12 @@ func (re *Relay) Start() {
 
 	// punch handler
 	go func() {
-		ln, err := net.ListenPacket("udp", "0.0.0.0:"+strconv.Itoa(re.port))
+		addr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+strconv.Itoa(re.port))
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		ln, err := net.ListenUDP("udp", addr)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -108,16 +118,16 @@ func (re *Relay) Start() {
 	srv.Shutdown(context.Background())
 }
 
-func (re *Relay) punchHandler(ln net.PacketConn) {
+func (re *Relay) punchHandler(ln *net.UDPConn) {
 	buf := make([]byte, 1024)
 	for {
-		n, addr, err := ln.ReadFrom(buf)
+		n, peerAddr, err := ln.ReadFromUDP(buf)
 		if err != nil {
 			slog.Error("read punch request error", "error", err)
 			continue
 		}
 
-		go func(token string, addr net.Addr) {
+		go func(token string, addr *net.UDPAddr) {
 			slog.Info("new punch request", "token", token, "addr", addr)
 
 			re.mu.Lock()
@@ -131,14 +141,21 @@ func (re *Relay) punchHandler(ln net.PacketConn) {
 			re.mu.Unlock()
 
 			slog.Info("new punch entry", "token", token, "addr", addr)
-		}(string(buf[:n]), addr)
+
+			go func(addr *net.UDPAddr) {
+				err := startUDPPunch(ln, addr, []byte("punch response"), re.punchAttempt, re.punchInterval)
+				if err != nil {
+					slog.Error("failed to send punch response", "token", token, "addr", addr, "error", err)
+				}
+			}(peerAddr)
+		}(string(buf[:n]), peerAddr)
 	}
 }
 
-func (re *Relay) punchRequest(ctx context.Context, conn *websocket.Conn, clientFingerprint string) (net.Addr, error) {
+func (re *Relay) punchRequest(ctx context.Context, conn *websocket.Conn) (*net.UDPAddr, error) {
 	token := uuid.New().String()
 
-	slog.Info("new punch request", "token", token, "client_fingerprint", clientFingerprint)
+	slog.Info("new punch request", "token", token)
 
 	re.mu.Lock()
 	_, ok := re.punchEntrys[token]
@@ -149,6 +166,8 @@ func (re *Relay) punchRequest(ctx context.Context, conn *websocket.Conn, clientF
 
 	re.punchEntrys[token] = nil
 	re.mu.Unlock()
+
+	slog.Info("punch entry created", "token", token)
 
 	defer func() {
 		re.mu.Lock()
@@ -163,7 +182,6 @@ func (re *Relay) punchRequest(ctx context.Context, conn *websocket.Conn, clientF
 		&WSMessagePunchRequest{
 			Token:              token,
 			PunchServerAddress: re.punchServerAddress,
-			ClientFingerprint:  clientFingerprint,
 		},
 	)
 	if err != nil {
@@ -176,6 +194,7 @@ func (re *Relay) punchRequest(ctx context.Context, conn *websocket.Conn, clientF
 	if err != nil {
 		return nil, fmt.Errorf("failed to send punch request: %w", err)
 	}
+	slog.Info("punch request sent", "token", token, "remote_addr", conn.RemoteAddr())
 
 	// wait for punch entry
 	ticker := time.NewTicker(300 * time.Millisecond)
@@ -216,12 +235,57 @@ func (re *Relay) serverHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	msg := &WSMessage{}
+	err = conn.ReadJSON(msg)
+	if err != nil {
+		slog.Error("failed to read message", "remote_addr", r.RemoteAddr, "error", err)
+		return
+	}
+	if msg.Type != WSMessageTypeServiceRequest {
+		slog.Error("invalid message type", "remote_addr", r.RemoteAddr, "type", msg.Type)
+		return
+	}
+	req := &WSMessageServiceRequest{}
+	err = json.Unmarshal(msg.Value, req)
+	if err != nil {
+		slog.Error("failed to unmarshal service request", "remote_addr", r.RemoteAddr, "error", err)
+		return
+	}
+
+	id := req.ID
+	fingerprint := req.ServerFingerprint
+	s := NewService(conn, fingerprint)
+
+	re.mu.Lock()
+	if re.services[id] == nil {
+		re.services[id] = []*Service{}
+	}
+	re.services[id] = append(re.services[id], s)
+	re.mu.Unlock()
+	defer func() {
+		slog.Info("service disconnected", "id", id, "remote_addr", conn.RemoteAddr())
+
+		re.mu.Lock()
+		defer re.mu.Unlock()
+
+		services := re.services[id]
+		for i, srv := range services {
+			if srv == s {
+				re.services[id] = append(services[:i], services[i+1:]...)
+				break
+			}
+		}
+	}()
+
 	conn.SetReadDeadline(time.Now().Add(re.readWait))
+
 	conn.SetPingHandler(func(appData string) error {
 		slog.Info("received ping", "remote_addr", r.RemoteAddr)
 		conn.SetReadDeadline(time.Now().Add(re.readWait))
 		conn.SetWriteDeadline(time.Now().Add(re.writeWait))
+		s.mu.Lock()
 		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(re.writeWait))
+		s.mu.Unlock()
 		if err != nil {
 			slog.Info("pong error", "remote_addr", r.RemoteAddr, "error", err)
 			return err
@@ -246,11 +310,12 @@ func (re *Relay) serverHandler(w http.ResponseWriter, r *http.Request) {
 
 		for {
 			<-ticker.C
-
 			slog.Info("sending ping", "remote_addr", r.RemoteAddr)
 
 			conn.SetWriteDeadline(time.Now().Add(re.writeWait))
+			s.mu.Lock()
 			err := conn.WriteMessage(websocket.PingMessage, nil)
+			s.mu.Unlock()
 			if err != nil {
 				slog.Info("ping error", "remote_addr", r.RemoteAddr, "error", err)
 				return
@@ -258,65 +323,9 @@ func (re *Relay) serverHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	err = re.handleWSConnection(ctx, conn)
-	if err != nil {
-		slog.Error("connection error", "remote_addr", r.RemoteAddr, "error", err)
-		return
-	}
-}
-
-func (re *Relay) handleWSConnection(ctx context.Context, conn *websocket.Conn) error {
-	id := ""
-	fingerprint := ""
-	for {
-		msg := &WSMessage{}
-		err := conn.ReadJSON(msg)
-		if err != nil {
-			return fmt.Errorf("failed to read message: %w", err)
-		}
-
-		if msg.Type != WSMessageTypeServiceRequest {
-			return fmt.Errorf("invalid message type: %d", msg.Type)
-		}
-
-		req := &WSMessageServiceRequest{}
-		err = json.Unmarshal(msg.Value, req)
-		if err != nil {
-			return fmt.Errorf("failed to unmarshal service request: %w", err)
-		}
-
-		id = req.ID
-		fingerprint = req.Fingerprint
-		break
-	}
-
-	s := NewService(conn, fingerprint)
-
-	re.mu.Lock()
-	if re.services[id] == nil {
-		re.services[id] = []*Service{}
-	}
-	re.services[id] = append(re.services[id], s)
-	re.mu.Unlock()
-
-	defer func() {
-		slog.Info("service disconnected", "id", id, "remote_addr", conn.RemoteAddr())
-
-		re.mu.Lock()
-		defer re.mu.Unlock()
-
-		services := re.services[id]
-		for i, srv := range services {
-			if srv == s {
-				re.services[id] = append(services[:i], services[i+1:]...)
-				break
-			}
-		}
-	}()
+	slog.Info("new service registered", "id", id, "remote_addr", conn.RemoteAddr(), "fingerprint", fingerprint)
 
 	<-ctx.Done()
-
-	return nil
 }
 
 func (re *Relay) clientHandler(w http.ResponseWriter, r *http.Request) {
@@ -329,28 +338,74 @@ func (re *Relay) clientHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var msg WSMessage
-	err = json.NewDecoder(r.Body).Decode(&msg)
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		slog.Error("failed to decode message", "remote_addr", r.RemoteAddr, "error", err)
-		w.WriteHeader(400)
+		slog.Error("upgrade error", "remote_addr", r.RemoteAddr, "error", err)
+		http.Error(w, "upgrade failed", 500)
 		return
 	}
-	if msg.Type != WSMessageTypeClientTunnelRequest {
-		slog.Error("invalid message type", "remote_addr", r.RemoteAddr, "type", msg.Type)
-		w.WriteHeader(400)
-		return
+	defer conn.Close()
 
+	conn.SetReadDeadline(time.Now().Add(re.readWait))
+
+	mu := sync.Mutex{}
+
+	conn.SetPingHandler(func(appData string) error {
+		slog.Info("received ping", "remote_addr", r.RemoteAddr)
+		conn.SetReadDeadline(time.Now().Add(re.readWait))
+		conn.SetWriteDeadline(time.Now().Add(re.writeWait))
+		mu.Lock()
+		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(re.writeWait))
+		mu.Unlock()
+		if err != nil {
+			slog.Info("pong error", "remote_addr", r.RemoteAddr, "error", err)
+			return err
+		}
+		return nil
+	})
+	conn.SetPongHandler(func(string) error {
+		slog.Info("received pong", "remote_addr", r.RemoteAddr)
+		conn.SetReadDeadline(time.Now().Add(re.readWait))
+		return nil
+	})
+
+	go func() {
+		ticker := time.NewTicker(re.pingInterval)
+		defer ticker.Stop()
+
+		for {
+			<-ticker.C
+			slog.Info("sending ping", "remote_addr", r.RemoteAddr)
+
+			conn.SetWriteDeadline(time.Now().Add(re.writeWait))
+			mu.Lock()
+			err := conn.WriteMessage(websocket.PingMessage, nil)
+			mu.Unlock()
+			if err != nil {
+				slog.Info("ping error", "remote_addr", r.RemoteAddr, "error", err)
+				return
+			}
+		}
+	}()
+
+	var msg WSMessage
+	err = conn.ReadJSON(&msg)
+	if err != nil {
+		slog.Error("failed to read message", "remote_addr", r.RemoteAddr, "error", err)
+		return
 	}
-	req := &WSMessageClientTunnelRequest{}
+	if msg.Type != WSMessageTypeTunnelRequest {
+		slog.Error("invalid message type", "remote_addr", r.RemoteAddr, "type", msg.Type)
+		return
+	}
+	req := &WSMessageTunnelRequest{}
 	err = json.Unmarshal(msg.Value, req)
 	if err != nil {
 		slog.Error("failed to unmarshal tunnel request", "remote_addr", r.RemoteAddr, "error", err)
-		w.WriteHeader(400)
 		return
 	}
 
-	slog.Info("received tunnel request", "id", req.ID, "remote_addr", r.RemoteAddr, "client_fingerprint", req.Fingerprint)
+	slog.Info("received tunnel request", "id", req.ID, "remote_addr", r.RemoteAddr, "client_fingerprint", req.ClientFingerprint)
 
 	var s *Service
 	re.mu.Lock()
@@ -366,7 +421,6 @@ func (re *Relay) clientHandler(w http.ResponseWriter, r *http.Request) {
 
 	if s == nil {
 		slog.Info("no available service", "id", req.ID, "remote_addr", r.RemoteAddr)
-		w.WriteHeader(503)
 		return
 	}
 	slog.Info("service found for tunnel request", "id", req.ID, "remote_addr", r.RemoteAddr)
@@ -379,31 +433,76 @@ func (re *Relay) clientHandler(w http.ResponseWriter, r *http.Request) {
 		re.mu.Unlock()
 	}()
 
-	addr, err := re.punchRequest(r.Context(), s.conn, req.Fingerprint)
-	if err != nil {
-		slog.Error("punch request error", "id", req.ID, "remote_addr", r.RemoteAddr, "error", err)
-		w.WriteHeader(500)
+	var srvAddr *net.UDPAddr
+	var clientAddr *net.UDPAddr
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	for _, peer := range []struct {
+		conn *websocket.Conn
+		addr **net.UDPAddr
+		mu   *sync.Mutex
+	}{
+		{s.conn, &srvAddr, &s.mu},
+		{conn, &clientAddr, &mu},
+	} {
+		go func(conn *websocket.Conn, addr **net.UDPAddr, mu *sync.Mutex) {
+			defer wg.Done()
+
+			slog.Info("starting punch request", "id", req.ID, "addr", conn.RemoteAddr())
+			var err error
+			mu.Lock()
+			*addr, err = re.punchRequest(r.Context(), conn)
+			mu.Unlock()
+			if err != nil {
+				slog.Error("punch request error", "id", req.ID, "addr", conn.RemoteAddr(), "error", err)
+				return
+			}
+			slog.Info("punch request completed", "id", req.ID, "addr", conn.RemoteAddr(), "punch_addr", *addr)
+		}(peer.conn, peer.addr, peer.mu)
+	}
+
+	wg.Wait()
+	if srvAddr == nil || clientAddr == nil {
+		slog.Error("failed to get punch address", "id", req.ID, "remote_addr", r.RemoteAddr)
 		return
 	}
 
-	value, err := json.Marshal(
-		&WSMessageClientTunnelResponse{
-			Address:           addr.String(),
-			ServerFingerprint: s.fingerprint,
-		},
-	)
-	if err != nil {
-		slog.Error("failed to marshal tunnel request", "id", req.ID, "remote_addr", r.RemoteAddr, "error", err)
-		return
+	slog.Info("punch completed", "id", req.ID, "remote_addr", r.RemoteAddr, "srv_addr", srvAddr, "client_addr", clientAddr)
+
+	wg.Add(2)
+	for _, peer := range []struct {
+		conn        *websocket.Conn
+		addr        *net.UDPAddr
+		fingerprint string
+		mu          *sync.Mutex
+	}{
+		{s.conn, clientAddr, req.ClientFingerprint, &s.mu},
+		{conn, srvAddr, s.fingerprint, &mu},
+	} {
+		go func(conn *websocket.Conn, addr *net.UDPAddr, fingerprint string, mu *sync.Mutex) {
+			defer wg.Done()
+
+			value, err := json.Marshal(WSMessageStartTunnel{
+				PeerAddress:     addr.String(),
+				PeerFingerprint: fingerprint,
+			})
+			if err != nil {
+				slog.Error("failed to marshal start tunnel message", "id", req.ID, "remote_addr", r.RemoteAddr, "error", err)
+				return
+			}
+			mu.Lock()
+			err = conn.WriteJSON(WSMessage{
+				Type:  WSMessageTypeStartTunnel,
+				Value: value,
+			})
+			mu.Unlock()
+			if err != nil {
+				slog.Error("failed to send start tunnel message", "id", req.ID, "remote_addr", r.RemoteAddr, "error", err)
+				return
+			}
+		}(peer.conn, peer.addr, peer.fingerprint, peer.mu)
 	}
-	err = json.NewEncoder(w).Encode(WSMessage{
-		Type:  WSMessageTypeClientTunnelResponse,
-		Value: value,
-	})
-	if err != nil {
-		slog.Error("failed to send tunnel response", "id", req.ID, "remote_addr", r.RemoteAddr, "error", err)
-		return
-	}
+	wg.Wait()
 }
 
 func (re *Relay) authorize(r *http.Request) error {
@@ -415,6 +514,27 @@ func (re *Relay) authorize(r *http.Request) error {
 
 	if subtle.ConstantTimeCompare([]byte(token), []byte(re.authToken)) != 1 {
 		return errors.New("unauthorized")
+	}
+
+	return nil
+}
+
+func startUDPPunch(conn *net.UDPConn, addr *net.UDPAddr, payload []byte, attempts int, interval time.Duration) error {
+	slog.Info("starting UDP punch", "address", addr.String(), "attempts", attempts, "interval_ms", interval.Milliseconds())
+	if attempts <= 0 {
+		return nil
+	}
+	if interval <= 0 {
+		interval = 10 * time.Millisecond
+	}
+
+	for i := 0; i < attempts; i++ {
+		if _, err := conn.WriteToUDP(payload, addr); err != nil {
+			return err
+		}
+		if i < attempts-1 {
+			time.Sleep(interval)
+		}
 	}
 
 	return nil
